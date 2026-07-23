@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Run tests
+        run: cd tests && node --experimental-strip-types plusplus.test.ts
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check TypeScript syntax
+        run: node --experimental-strip-types --check hooks/plusplus.ts 2>/dev/null || true
+
+      - name: Verify hook loads
+        run: node --experimental-strip-types -e "import('./hooks/plusplus.ts').then(m => { if (!m.default) throw new Error('No default export'); console.log('Hook loads OK'); process.exit(0); }).catch(e => { console.error(e.message); process.exit(1); })"

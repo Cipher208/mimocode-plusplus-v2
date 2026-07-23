@@ -37,8 +37,8 @@ function hashText(text: string): string {
 }
 
 const REDACT_PATTERNS: [RegExp, string][] = [
-  [/(ghp_[A-Za-z0-9]{36})/g, "github_pat"],
-  [/(gho_[A-Za-z0-9]{36})/g, "github_oauth"],
+  [/(ghp_[A-Za-z0-9]{36,50})/g, "github_pat"],
+  [/(gho_[A-Za-z0-9]{36,50})/g, "github_oauth"],
   [/(github_pat_[A-Za-z0-9]{22}_[A-Za-z0-9]{59})/g, "github_fine_grained"],
   [/(sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20})/g, "openai_api_key"],
   [/(sk-ant-[A-Za-z0-9-]{20,})/g, "anthropic_api_key"],
@@ -62,13 +62,14 @@ function sanitizeOutput(text: string): { sanitized: string; redacted: number } {
 // ─── Command Guard ────────────────────────────────────────────────────
 
 const DANGEROUS: [RegExp, string][] = [
-  [/\brm\s+(-[^\s]*[rf][^\s]*|-[^\s]*r[^\s]*f[^\s]*|-[^\s]*f[^\s]*r[^\s]*)\s+(\/|\*|\.|~|\$HOME)/i, "destructive recursive remove"],
-  [/\brm\s+-rf?\s+\/\s*$/i, "rm -rf /"],
+  // rm: covers -rf, -r -f, --recursive --force, and bare -r on root
+  [/\brm\s+(-[^\s]*r[^\s]*f[^\s]*|-f\s+-r|--recursive\s+--force|-r\s+-f)\s+(\/|\*|\.|~|\$HOME)/i, "destructive recursive remove"],
+  [/\brm\s+-r\s+(\/\s*$|\/\*)/i, "rm -r on root"],
   [/\bgit\s+reset\s+--hard\b/i, "hard git reset"],
   [/\bgit\s+clean\s+-[^\s]*[fd][^\s]*/i, "git clean removes untracked files"],
   [/\bgit\s+push\s+--force/i, "force push"],
   [/\bgit\s+push\s+-f\b/i, "force push"],
-  [/\b(curl|wget)\b.+\|\s*(sh|bash|powershell|pwsh)\b/i, "remote script pipe to shell"],
+  [/\b(curl|wget)\s+\S+\s*\|\s*(sh|bash|powershell|pwsh)\b/i, "remote script pipe to shell"],
   [/\bchmod\s+-R\s+777\b/i, "recursive world-writable permissions"],
   [/\bdel\s+\/[sfq]\s+(\\|\/|\*)/i, "destructive Windows delete"],
   [/\bdocker\s+rm\s+-f\s+--all/i, "remove all containers"],

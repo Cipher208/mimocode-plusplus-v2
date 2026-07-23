@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-07-23
+
+### Fixed
+- `rm` regex gaps: now covers `-rf`, `-r -f`, `--recursive --force`, `-r /` on root
+- `gho_` token pattern: expanded from 36 to 36-50 chars to match real tokens
+- GitHub Actions: pinned all actions to commit SHA for security
+- GitHub Actions: added `permissions: contents: read` for least privilege
+
+### Changed
+- Replaced all `any` types with proper interfaces (`GuardResult`, `Finding`, `ToolInput`, `ToolOutput`, `AfterOutput`, `ToolArgs`)
+- Extracted `runPolicyCheck` into 4 focused sub-functions: `checkForbiddenFiles`, `checkSensitivePaths`, `checkLargeDiff`, `checkTestEvidence`
+- Reduced cyclomatic complexity from 22 to ~8
+- Added `blockIf` helper to DRY up guard blocking logic
+- Tests now import from hook module (no DRY violations)
+
+### Added
+- `CONTRIBUTING.md` — contributor guide
+- `CODE_OF_CONDUCT.md` — community standards
+- `LICENSE` — MIT license file
+- `FUTURE_PLAN.md` — planned features from opencode-plusplus
+
 ## [0.3.0] - 2026-07-23
 
 ### Added

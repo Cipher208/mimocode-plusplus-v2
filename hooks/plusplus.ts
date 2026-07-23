@@ -15,6 +15,7 @@
 
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs"
 import { join } from "path"
+import { execSync } from "child_process"
 
 const LOG = process.env.OPENCPP_LOG || ""
 const projectDir = process.env.PROJECT_DIR || process.cwd()
@@ -26,6 +27,36 @@ function log(msg: string) {
 
 function ensureDir(dir: string) {
   try { mkdirSync(dir, { recursive: true }) } catch {}
+}
+
+// ─── Types ────────────────────────────────────────────────────────────
+
+interface GuardResult { severity: "blocker" | "warn"; message: string }
+
+interface Finding {
+  id: string
+  kind: "forbidden" | "risk" | "required"
+  status: "failed" | "warning" | "missing" | "satisfied"
+  message: string
+  file?: string
+  evidence: string[]
+}
+
+interface ToolInput { tool: string }
+interface ToolOutput {
+  args: Record<string, unknown>
+  cancel?: boolean
+  cancelReason?: string
+}
+interface AfterOutput {
+  title: string
+  output: string
+  metadata: { exitCode?: number; [key: string]: unknown }
+}
+interface ToolArgs {
+  command?: string
+  file_path?: string
+  [key: string]: unknown
 }
 
 // ─── Hash & Sanitize ──────────────────────────────────────────────────
@@ -62,7 +93,6 @@ function sanitizeOutput(text: string): { sanitized: string; redacted: number } {
 // ─── Command Guard ────────────────────────────────────────────────────
 
 const DANGEROUS: [RegExp, string][] = [
-  // rm: covers -rf, -r -f, --recursive --force, and bare -r on root
   [/\brm\s+(-[^\s]*r[^\s]*f[^\s]*|-f\s+-r|--recursive\s+--force|-r\s+-f)\s+(\/|\*|\.|~|\$HOME)/i, "destructive recursive remove"],
   [/\brm\s+-r\s+(\/\s*$|\/\*)/i, "rm -r on root"],
   [/\bgit\s+reset\s+--hard\b/i, "hard git reset"],
@@ -76,7 +106,7 @@ const DANGEROUS: [RegExp, string][] = [
   [/\bdocker\s+system\s+prune\s+-a/i, "prune all docker resources"],
 ]
 
-function checkDangerous(cmd: string): { severity: string; message: string } | null {
+function checkDangerous(cmd: string): GuardResult | null {
   for (const [p, r] of DANGEROUS) if (p.test(cmd)) return { severity: "blocker", message: `Blocked: ${r}` }
   return null
 }
@@ -96,7 +126,7 @@ const PROTECTED: [RegExp, string][] = [
   [/\bcoverage\//, "coverage"], [/__pycache__\//, "pycache"], [/\.next\//, "next.js"],
 ]
 
-function checkPath(fp: string): { severity: string; message: string } | null {
+function checkPath(fp: string): GuardResult | null {
   const n = fp.replace(/\\/g, "/")
   for (const [p, r] of SECRETS) if (p.test(n)) return { severity: "blocker", message: `Blocked (${r}): ${fp}` }
   for (const [p, r] of PROTECTED) if (p.test(n)) return { severity: "warn", message: `Warning: ${r}: ${fp}` }
@@ -105,7 +135,7 @@ function checkPath(fp: string): { severity: string; message: string } | null {
 
 // ─── Script/Target Validation ─────────────────────────────────────────
 
-function checkNpm(cmd: string, cwd: string): { severity: string; message: string } | null {
+function checkNpm(cmd: string, cwd: string): GuardResult | null {
   const m = cmd.match(/^(?:npm|yarn|pnpm)\s+(?:run\s+)?(\w+)/)
   if (!m) return null
   const s = m[1]
@@ -117,7 +147,7 @@ function checkNpm(cmd: string, cwd: string): { severity: string; message: string
   } catch { return null }
 }
 
-function checkMake(cmd: string, cwd: string): { severity: string; message: string } | null {
+function checkMake(cmd: string, cwd: string): GuardResult | null {
   const m = cmd.match(/^(?:make|gmake)\s+(\S+)/)
   if (!m) return null
   const t = m[1]; if (t.startsWith("-")) return null
@@ -131,18 +161,15 @@ function checkMake(cmd: string, cwd: string): { severity: string; message: strin
 
 // ─── Evidence Recording ───────────────────────────────────────────────
 
-function recordEvidence(tool: string, args: any, output: any) {
+function recordEvidence(tool: string, args: ToolArgs, output: { stdout?: string; exitCode?: number }) {
   ensureDir(SIDECAR_DIR)
-  const stdout = String(output?.stdout ?? output?.output ?? "")
-  const stderr = String(output?.stderr ?? output?.error ?? "")
-  const { sanitized: sc, redacted: sr } = sanitizeOutput(stdout)
-  const { sanitized: ec, redacted: er } = sanitizeOutput(stderr)
+  const stdout = String(output?.stdout ?? "")
+  const { sanitized, redacted } = sanitizeOutput(stdout)
   const entry = {
     timestamp: new Date().toISOString(), tool,
     exitCode: output?.exitCode ?? null,
-    stdoutHash: hashText(sc), stdoutPreview: sc.slice(0, 200),
-    stdoutTruncated: stdout.length > 10000, stdoutRedacted: sr > 0,
-    stderrHash: hashText(ec), stderrRedacted: er > 0,
+    stdoutHash: hashText(sanitized), stdoutPreview: sanitized.slice(0, 200),
+    stdoutTruncated: stdout.length > 10000, stdoutRedacted: redacted > 0,
   }
   writeFileSync(join(SIDECAR_DIR, "evidence.jsonl"), JSON.stringify(entry) + "\n", { flag: "a" })
 }
@@ -166,24 +193,18 @@ function scheduleVerify() {
   verifyTimer = setTimeout(maybeVerify, DEBOUNCE_MS)
 }
 
-// ─── Policy Engine (simplified) ───────────────────────────────────────
-
-interface Finding { id: string; kind: "forbidden"|"risk"|"required"; status: "failed"|"warning"|"missing"|"satisfied"; message: string; file?: string; evidence: string[] }
+// ─── Policy Engine (refactored) ───────────────────────────────────────
 
 function getChangedFiles(): string[] {
   try {
-    const { execSync } = require("child_process")
     const out = execSync("git status --porcelain --untracked-files=all", { cwd: projectDir, encoding: "utf8", timeout: 5000 })
     return out.split("\n").filter(l => l.length > 3).map(l => l.slice(3).trim().split(" -> ").pop()!).filter(Boolean)
   } catch { return [] }
 }
 
-function runPolicyCheck() {
+function checkForbiddenFiles(files: string[]): Finding[] {
   const findings: Finding[] = []
-  const changed = getChangedFiles()
-
-  // Forbidden: generated source changed directly
-  for (const f of changed) {
+  for (const f of files) {
     if (/\.agent-context\//.test(f) || f === "AGENTS.md") {
       findings.push({ id: "forbidden.generated", kind: "forbidden", status: "failed", message: `Generated file changed: ${f}`, file: f, evidence: ["Direct edit to generated output"] })
     }
@@ -191,105 +212,103 @@ function runPolicyCheck() {
       findings.push({ id: "forbidden.build", kind: "forbidden", status: "failed", message: `Build output changed: ${f}`, file: f, evidence: ["Direct edit to build artifact"] })
     }
   }
+  return findings
+}
 
-  // Risk: sensitive paths
-  for (const f of changed) {
+function checkSensitivePaths(files: string[]): Finding[] {
+  const findings: Finding[] = []
+  for (const f of files) {
     if (/(^|\/)(auth|session|security|payment|billing)(\/|\.|-|_)/i.test(f)) {
       findings.push({ id: "risk.sensitive", kind: "risk", status: "warning", message: `Sensitive area changed: ${f}`, file: f, evidence: ["Auth/payment/security file modified"] })
     }
   }
+  return findings
+}
 
-  // Risk: large diff
-  if (changed.length >= 10) {
-    findings.push({ id: "risk.large-diff", kind: "risk", status: "warning", message: `${changed.length} files changed`, evidence: ["Large diff detected"] })
-  }
+function checkLargeDiff(count: number): Finding[] {
+  if (count < 10) return []
+  return [{ id: "risk.large-diff", kind: "risk", status: "warning", message: `${count} files changed`, evidence: ["Large diff detected"] }]
+}
 
-  // Required: evidence exists
+function checkTestEvidence(files: string[]): Finding[] {
   const evidenceFile = join(SIDECAR_DIR, "evidence.jsonl")
-  if (existsSync(evidenceFile)) {
-    const lines = readFileSync(evidenceFile, "utf8").split("\n").filter(Boolean)
-    const recentEvidence = lines.slice(-20)
-    const hasTestEvidence = recentEvidence.some(l => l.includes('"tool":"bash"') && (l.includes("test") || l.includes("pytest") || l.includes("jest")))
-    if (changed.some(f => /\.(ts|tsx|js|jsx|py|rs)$/.test(f)) && !hasTestEvidence) {
-      findings.push({ id: "required.tests", kind: "required", status: "missing", message: "Source changes without test evidence", evidence: ["Run tests after source changes"] })
-    }
+  if (!existsSync(evidenceFile)) return []
+  const lines = readFileSync(evidenceFile, "utf8").split("\n").filter(Boolean)
+  const recent = lines.slice(-20)
+  const hasTests = recent.some(l => l.includes('"tool":"bash"') && (l.includes("test") || l.includes("pytest") || l.includes("jest")))
+  const hasSourceChanges = files.some(f => /\.(ts|tsx|js|jsx|py|rs)$/.test(f))
+  if (hasSourceChanges && !hasTests) {
+    return [{ id: "required.tests", kind: "required", status: "missing", message: "Source changes without test evidence", evidence: ["Run tests after source changes"] }]
   }
+  return []
+}
 
-  // Log findings
+function writeReport(findings: Finding[]) {
   const blocked = findings.filter(f => f.kind === "forbidden" && f.status === "failed")
   const warnings = findings.filter(f => f.kind === "risk")
   const missing = findings.filter(f => f.kind === "required" && f.status === "missing")
 
-  if (blocked.length || warnings.length || missing.length) {
-    ensureDir(SIDECAR_DIR)
-    const report = { timestamp: new Date().toISOString(), summary: { forbidden: blocked.length, risks: warnings.length, requiredMissing: missing.length }, findings }
-    writeFileSync(join(SIDECAR_DIR, "policy-report.json"), JSON.stringify(report, null, 2))
+  if (!blocked.length && !warnings.length && !missing.length) return
 
-    if (blocked.length) log(`POLICY BLOCKED: ${blocked.map(f => f.message).join("; ")}`)
-    if (warnings.length) log(`POLICY WARN: ${warnings.map(f => f.message).join("; ")}`)
-    if (missing.length) log(`POLICY MISSING: ${missing.map(f => f.message).join("; ")}`)
-  }
+  ensureDir(SIDECAR_DIR)
+  const report = { timestamp: new Date().toISOString(), summary: { forbidden: blocked.length, risks: warnings.length, requiredMissing: missing.length }, findings }
+  writeFileSync(join(SIDECAR_DIR, "policy-report.json"), JSON.stringify(report, null, 2))
+
+  if (blocked.length) log(`POLICY BLOCKED: ${blocked.map(f => f.message).join("; ")}`)
+  if (warnings.length) log(`POLICY WARN: ${warnings.map(f => f.message).join("; ")}`)
+  if (missing.length) log(`POLICY MISSING: ${missing.map(f => f.message).join("; ")}`)
+}
+
+function runPolicyCheck() {
+  const changed = getChangedFiles()
+  const findings = [
+    ...checkForbiddenFiles(changed),
+    ...checkSensitivePaths(changed),
+    ...checkLargeDiff(changed.length),
+    ...checkTestEvidence(changed),
+  ]
+  writeReport(findings)
 }
 
 // ─── Hook Implementation ──────────────────────────────────────────────
 
-export default {
-  "tool.execute.before": async (
-    input: { tool: string },
-    output: { args: any; cancel?: boolean; cancelReason?: string },
-  ) => {
-    const tool = input.tool?.toLowerCase()
-    const args = output.args
-    if (!args || typeof args !== "object") return
+function blockIf(output: ToolOutput, check: GuardResult | null) {
+  if (!check) return false
+  log(`BLOCKED: ${check.message}`)
+  output.cancel = true
+  output.cancelReason = check.message
+  return true
+}
 
-    // Command guard (bash/shell only)
+export default {
+  "tool.execute.before": async (input: ToolInput, output: ToolOutput) => {
+    const tool = input.tool?.toLowerCase()
+    const args = output.args as ToolArgs
+    if (!args) return
+
     if (tool === "bash" || tool === "shell") {
       const cmd = args.command
       if (typeof cmd !== "string" || !cmd) return
-
-      const danger = checkDangerous(cmd)
-      if (danger) { log(`BLOCKED: ${danger.message}`); output.cancel = true; output.cancelReason = danger.message; return }
-
-      const npm = checkNpm(cmd, projectDir)
-      if (npm?.severity === "blocker") { log(`BLOCKED: ${npm.message}`); output.cancel = true; output.cancelReason = npm.message; return }
-
-      const mk = checkMake(cmd, projectDir)
-      if (mk?.severity === "blocker") { log(`BLOCKED: ${mk.message}`); output.cancel = true; output.cancelReason = mk.message; return }
+      if (blockIf(output, checkDangerous(cmd))) return
+      if (blockIf(output, checkNpm(cmd, projectDir))) return
+      if (blockIf(output, checkMake(cmd, projectDir))) return
     }
 
-    // Path guard (write/edit tools)
     if (tool === "write" || tool === "edit") {
       const fp = args.file_path
-      if (fp) {
-        const pc = checkPath(fp)
-        if (pc?.severity === "blocker") { log(`BLOCKED: ${pc.message}`); output.cancel = true; output.cancelReason = pc.message; return }
-      }
+      if (fp) blockIf(output, checkPath(fp))
     }
   },
 
-  "tool.execute.after": async (
-    input: { tool: string },
-    output: { title: string; output: string; metadata: any },
-  ) => {
+  "tool.execute.after": async (input: ToolInput, output: AfterOutput) => {
     const tool = input.tool?.toLowerCase()
     const exitCode = output.metadata?.exitCode ?? null
 
-    // Record evidence
-    recordEvidence(tool, input, { stdout: output.output, exitCode })
+    recordEvidence(tool, input as unknown as ToolArgs, { stdout: output.output, exitCode })
 
-    // Mark dirty on write/edit operations
-    if (tool === "write" || tool === "edit") {
-      markDirty()
-      scheduleVerify()
-    }
-
-    if (exitCode !== 0 && exitCode !== null) {
-      log(`TOOL_END: ${tool} exit=${exitCode}`)
-    }
+    if (tool === "write" || tool === "edit") { markDirty(); scheduleVerify() }
+    if (exitCode !== 0 && exitCode !== null) log(`TOOL_END: ${tool} exit=${exitCode}`)
   },
 
-  // Trigger verification on idle (no tool calls for DEBOUNCE_MS)
-  "session.userQuery.post": async () => {
-    maybeVerify()
-  },
+  "session.userQuery.post": async () => { maybeVerify() },
 }
